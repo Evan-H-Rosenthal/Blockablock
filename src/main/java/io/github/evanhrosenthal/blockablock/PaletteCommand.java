@@ -29,7 +29,7 @@ import org.bukkit.event.Listener;
 
 final class PaletteCommand implements TabExecutor, Listener {
     private static final Duration RESET_TIMEOUT = Duration.ofSeconds(30);
-    private static final List<String> ADMIN_ACTIONS = List.of("grant", "revoke", "list", "blacklist", "toggle", "reset");
+    private static final List<String> HELP_TOPICS = List.of("grant", "revoke", "list", "blacklist", "toggle", "reset");
     private static final List<String> SELECTORS = List.of("@s", "@p", "@a", "@r", "@e", "@n");
     private static final List<String> BLOCK_KEYS = Arrays.stream(Material.values())
             .filter(Palette::isBlockItem).map(material -> material.getKey().getKey()).sorted().toList();
@@ -37,22 +37,23 @@ final class PaletteCommand implements TabExecutor, Listener {
     private final BlockablockPlugin plugin;
     private final PaletteStore store;
     private final PaletteInventory inventory;
+    private final PaletteHooks hooks;
     private final Map<Object, Long> resetPrompts = new ConcurrentHashMap<>();
 
-    PaletteCommand(BlockablockPlugin plugin, PaletteStore store, PaletteInventory inventory) {
+    PaletteCommand(BlockablockPlugin plugin, PaletteStore store, PaletteInventory inventory, PaletteHooks hooks) {
         this.plugin = plugin;
         this.store = store;
         this.inventory = inventory;
+        this.hooks = hooks;
     }
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage("/" + label + (isOperator(sender) ? " <grant|revoke|list|blacklist|toggle|reset>" : " list <player>"));
-            return true;
+            return help(sender, label, args);
         }
         String action = args[0].toLowerCase(Locale.ROOT);
-        if (!action.equals("list") && !isOperator(sender)) {
+        if (!action.equals("list") && !action.equals("help") && !isOperator(sender)) {
             sender.sendMessage("Only operators can change Blockablock settings.");
             return true;
         }
@@ -63,6 +64,7 @@ final class PaletteCommand implements TabExecutor, Listener {
                 case "list" -> list(sender, label, args);
                 case "toggle" -> toggle(sender, label, args);
                 case "reset" -> reset(sender, label, args);
+                case "help" -> help(sender, label, args);
                 default -> false;
             };
         } catch (IOException ex) {
@@ -97,11 +99,14 @@ final class PaletteCommand implements TabExecutor, Listener {
             case "blacklist" -> palette -> palette.blacklist(block);
             default -> throw new IllegalStateException("Unexpected palette command " + action);
         };
-        store.update(players, update);
+        Material finiteGrant = action.equals("grant") && !store.settings().infiniteReplenish() ? block : null;
+        store.update(players, update, finiteGrant, hooks.configured(action));
         for (OfflinePlayer target : players) {
             Player online = target.getPlayer();
             if (online != null) {
                 inventory.refresh(online);
+                inventory.deliverFinite(online);
+                hooks.schedule(online);
             }
         }
         String verb = switch (action) {
@@ -111,6 +116,25 @@ final class PaletteCommand implements TabExecutor, Listener {
         };
         sender.sendMessage(verb + " " + (block == null ? "all blocks" : block.getKey()) + " for "
                 + players.size() + (players.size() == 1 ? " player." : " players."));
+        return true;
+    }
+
+    private boolean help(CommandSender sender, String label, String[] args) {
+        String usage = "/" + label + " help <" + String.join("|", HELP_TOPICS) + ">";
+        if (args.length != 2) {
+            sender.sendMessage(usage);
+            return true;
+        }
+        String detail = switch (args[1].toLowerCase(Locale.ROOT)) {
+            case "grant" -> "grant <player> <block> — Gives a block reward.";
+            case "revoke" -> "revoke <player> <block|*> — Removes a grant or all grants.";
+            case "list" -> "list <player> — Privately shows a player's saved palette.";
+            case "blacklist" -> "blacklist <player> <block|*> — Blocks possession and use.";
+            case "toggle" -> "toggle — Turns Blockablock on or off.";
+            case "reset" -> "reset — Clears all players' palettes after you confirm with yes.";
+            default -> null;
+        };
+        sender.sendMessage(detail == null ? usage : "/" + label + " " + detail);
         return true;
     }
 
@@ -125,7 +149,7 @@ final class PaletteCommand implements TabExecutor, Listener {
             Palette palette = store.palette(id);
             String name = target.getName() == null ? store.name(id) : target.getName();
             lines.add("Blockablock palette for " + (name == null ? id : name));
-            addBlocks(lines, "Infinite blocks", PaletteStore.blockKeys(palette.grants()));
+            addBlocks(lines, "Granted blocks", PaletteStore.blockKeys(palette.grants()));
             if (palette.blacklistAll()) {
                 lines.add("Blacklisted blocks include all block items except the grants above.");
             } else {
@@ -192,7 +216,10 @@ final class PaletteCommand implements TabExecutor, Listener {
             return true;
         }
         store.toggle();
-        Bukkit.getOnlinePlayers().forEach(inventory::refresh);
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            inventory.refresh(player);
+            inventory.deliverFinite(player);
+        }
         sender.sendMessage(store.enabled() ? "Blockablock is on." : "Blockablock is off.");
         return true;
     }
@@ -269,9 +296,13 @@ final class PaletteCommand implements TabExecutor, Listener {
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
         boolean operator = isOperator(sender);
         if (args.length <= 1) {
-            return complete(operator ? ADMIN_ACTIONS.stream() : Stream.of("list"), args.length == 0 ? "" : args[0]);
+            Stream<String> actions = operator ? Stream.concat(Stream.of("help"), HELP_TOPICS.stream()) : Stream.of("help", "list");
+            return complete(actions, args.length == 0 ? "" : args[0]);
         }
         String action = args[0].toLowerCase(Locale.ROOT);
+        if (args.length == 2 && action.equals("help")) {
+            return complete(HELP_TOPICS.stream(), args[1]);
+        }
         if (args.length == 2 && (action.equals("list")
                 || (operator && List.of("grant", "revoke", "blacklist").contains(action)))) {
             return complete(Stream.concat(SELECTORS.stream(), Bukkit.getOnlinePlayers().stream().map(Player::getName)), args[1]);

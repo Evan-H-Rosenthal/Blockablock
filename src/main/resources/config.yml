@@ -1,0 +1,20 @@
+# How many blocks each grant issues, and how many an infinite reward refills to.
+blocks-per-grant: 2
+
+# An infinite reward refills at or below this remaining amount.
+blocks-for-replenish: 2
+infinite-replenish: true
+
+# Commands run with console permissions at the affected player. Use @s for that player.
+commands-on-grant: []
+commands-on-revoke: []
+commands-on-blacklist: []
+
+# Include any spaces you want between these strings and the block's name.
+prepended-text: ''
+appended-text: ''
+name-color: '#FFFFFF'
+
+# Saved plugin state.
+enabled: true
+players: {}

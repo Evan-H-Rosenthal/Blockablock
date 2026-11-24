@@ -6,4 +6,4 @@ description: Unlock infinite building blocks and restrict selected blocks in Sur
 commands:
   blockablock:
     description: Manage or view Blockablock palettes.
-    usage: /blockablock <grant|revoke|list|blacklist|toggle|reset>
+    usage: /blockablock help

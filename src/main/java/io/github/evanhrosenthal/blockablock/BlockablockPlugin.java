@@ -23,15 +23,20 @@ public final class BlockablockPlugin extends JavaPlugin {
             return;
         }
 
-        inventory = new PaletteInventory(store, new NamespacedKey(this, "infinite-owner"));
-        var commands = new PaletteCommand(this, store, inventory);
+        inventory = new PaletteInventory(store, new NamespacedKey(this, "infinite-owner"), getLogger());
+        var hooks = new PaletteHooks(this, store);
+        var commands = new PaletteCommand(this, store, inventory, hooks);
         var root = Objects.requireNonNull(getCommand("blockablock"));
         root.setExecutor(commands);
         root.setTabCompleter(commands);
         getServer().getPluginManager().registerEvents(inventory, this);
+        getServer().getPluginManager().registerEvents(hooks, this);
         getServer().getPluginManager().registerEvents(commands, this);
         getServer().getScheduler().runTaskTimer(this, inventory::tick, 1, 1);
-        Bukkit.getOnlinePlayers().forEach(inventory::refresh);
+        for (var player : Bukkit.getOnlinePlayers()) {
+            inventory.refreshOnJoin(player);
+            hooks.schedule(player);
+        }
     }
 
     @Override

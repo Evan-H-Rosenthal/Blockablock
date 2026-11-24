@@ -1,12 +1,14 @@
 package io.github.evanhrosenthal.blockablock;
 
+import java.io.IOException;
 import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import net.kyori.adventure.text.Component;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
 import org.bukkit.Material;
@@ -42,11 +44,15 @@ final class PaletteInventory implements Listener {
 
     private final PaletteStore store;
     private final NamespacedKey ownerKey;
+    private final Logger logger;
     private final Map<UUID, Map<Material, Integer>> placementSlots = new HashMap<>();
+    private final Map<UUID, Set<Material>> pendingRefills = new HashMap<>();
+    private int deliveryTick;
 
-    PaletteInventory(PaletteStore store, NamespacedKey ownerKey) {
+    PaletteInventory(PaletteStore store, NamespacedKey ownerKey, Logger logger) {
         this.store = store;
         this.ownerKey = ownerKey;
+        this.logger = logger;
     }
 
     private Palette activePalette(Player player) {
@@ -70,9 +76,10 @@ final class PaletteInventory implements Listener {
     private ItemStack reward(Material block, String owner) {
         var stack = ItemStack.of(block);
         var meta = stack.getItemMeta();
-        meta.itemName(Component.text("Infinite ").append(Component.translatable(block.translationKey())));
-        meta.setMaxStackSize(1);
-        meta.getPersistentDataContainer().set(ownerKey, PersistentDataType.STRING, owner);
+        meta.itemName(store.settings().blockName(block));
+        if (owner != null) {
+            meta.getPersistentDataContainer().set(ownerKey, PersistentDataType.STRING, owner);
+        }
         stack.setItemMeta(meta);
         return stack;
     }
@@ -81,61 +88,82 @@ final class PaletteInventory implements Listener {
         if (!store.enabled()) {
             return;
         }
+        boolean checkDeliveries = ++deliveryTick == 20;
+        if (checkDeliveries) {
+            deliveryTick = 0;
+        }
         for (Player player : Bukkit.getOnlinePlayers()) {
             if (store.palette(player.getUniqueId()) != Palette.EMPTY) {
                 refresh(player);
+                if (checkDeliveries) {
+                    deliverFinite(player);
+                }
             }
         }
     }
 
     void refresh(Player player) {
+        refresh(player, false);
+    }
+
+    void refreshOnJoin(Player player) {
+        refresh(player, true);
+        deliverFinite(player);
+    }
+
+    private void refresh(Player player, boolean updateAppearance) {
         Map<Material, Integer> preferred = placementSlots.remove(player.getUniqueId());
         if (!player.isDead()) {
-            reconcile(player, activePalette(player), preferred == null ? Map.of() : preferred);
+            reconcile(player, activePalette(player), preferred == null ? Map.of() : preferred, updateAppearance);
         }
     }
 
     void clearRewards(Player player) {
-        reconcile(player, Palette.EMPTY, Map.of());
+        reconcile(player, Palette.EMPTY, Map.of(), false);
     }
 
-    private void reconcile(Player player, Palette palette, Map<Material, Integer> preferred) {
+    private void reconcile(Player player, Palette palette, Map<Material, Integer> preferred, boolean updateAppearance) {
         var inventory = player.getInventory();
-        String playerId = player.getUniqueId().toString();
-        Set<Material> found = EnumSet.noneOf(Material.class);
+        UUID id = player.getUniqueId();
+        String playerId = id.toString();
+        Map<Material, Integer> stock = new HashMap<>();
 
         // Count the cursor first so moving a reward never causes a second copy to be issued.
         ItemStack cursor = player.getItemOnCursor();
-        ItemStack keptCursor = keep(cursor, palette, playerId, found);
+        ItemStack keptCursor = keep(cursor, palette, playerId, stock, updateAppearance);
         if (keptCursor != cursor) {
             player.setItemOnCursor(keptCursor);
         }
         for (int slot = 0; slot < inventory.getSize(); slot++) {
             ItemStack item = inventory.getItem(slot);
-            ItemStack kept = keep(item, palette, playerId, found);
+            ItemStack kept = keep(item, palette, playerId, stock, updateAppearance);
             if (kept != item) {
                 inventory.setItem(slot, kept);
             }
         }
-        for (Material block : palette.grants()) {
-            Integer slot = preferred.get(block);
-            if (!found.contains(block) && slot != null && isEmpty(inventory.getItem(slot))) {
-                inventory.setItem(slot, reward(block, playerId));
-                found.add(block);
-            }
+        Set<Material> unfinished = pendingRefills.remove(id);
+        PaletteSettings settings = store.settings();
+        if (!settings.infiniteReplenish()) {
+            return;
         }
         for (Material block : palette.grants()) {
-            if (!found.contains(block)) {
-                int slot = inventory.firstEmpty();
-                if (slot == -1) {
-                    break;
+            int count = stock.getOrDefault(block, 0);
+            if (count < settings.blocksPerGrant() && (count <= settings.blocksForReplenish()
+                    || (unfinished != null && unfinished.contains(block)))) {
+                Integer slot = preferred.get(block);
+                if (count == 0 && slot == null && inventory.firstEmpty() == -1) {
+                    continue;
                 }
-                inventory.setItem(slot, reward(block, playerId));
+                int needed = settings.blocksPerGrant() - count;
+                if (refill(inventory, reward(block, playerId), needed, slot) > 0) {
+                    pendingRefills.computeIfAbsent(id, ignored -> EnumSet.noneOf(Material.class)).add(block);
+                }
             }
         }
     }
 
-    private ItemStack keep(ItemStack item, Palette palette, String playerId, Set<Material> found) {
+    private ItemStack keep(ItemStack item, Palette palette, String playerId, Map<Material, Integer> stock,
+                           boolean updateAppearance) {
         if (isEmpty(item)) {
             return item;
         }
@@ -147,27 +175,118 @@ final class PaletteInventory implements Listener {
         if (owner == null) {
             return item;
         }
-        if (!owner.equals(playerId) || !palette.grants().contains(material) || !found.add(material)) {
+        PaletteSettings settings = store.settings();
+        if (!settings.infiniteReplenish() || !owner.equals(playerId) || !palette.grants().contains(material)) {
             return null;
         }
-        return item.getAmount() == 1 ? item : reward(material, playerId);
+        int retained = Math.min(item.getAmount(), settings.blocksPerGrant() - stock.getOrDefault(material, 0));
+        if (retained == 0) {
+            return null;
+        }
+        stock.merge(material, retained, Integer::sum);
+        if (updateAppearance) {
+            return reward(material, playerId).asQuantity(retained);
+        }
+        return retained == item.getAmount() ? item : item.asQuantity(retained);
+    }
+
+    private int refill(PlayerInventory inventory, ItemStack template, int needed, Integer preferred) {
+        int limit = Math.min(template.getMaxStackSize(), inventory.getMaxStackSize());
+        if (preferred != null) {
+            ItemStack item = inventory.getItem(preferred);
+            if (isEmpty(item) || template.isSimilar(item)) {
+                int current = isEmpty(item) ? 0 : item.getAmount();
+                int added = Math.min(needed, Math.max(0, limit - current));
+                if (added > 0) {
+                    inventory.setItem(preferred, template.asQuantity(current + added));
+                    needed -= added;
+                }
+            }
+        }
+        for (int slot = 0; slot < inventory.getSize() && needed > 0; slot++) {
+            ItemStack item = inventory.getItem(slot);
+            if (!isEmpty(item) && item.getType() == template.getType() && template.isSimilar(item)) {
+                int added = Math.min(needed, Math.max(0, limit - item.getAmount()));
+                if (added > 0) {
+                    inventory.setItem(slot, template.asQuantity(item.getAmount() + added));
+                    needed -= added;
+                }
+            }
+        }
+        while (needed > 0) {
+            int slot = inventory.firstEmpty();
+            if (slot == -1) {
+                break;
+            }
+            int added = Math.min(needed, limit);
+            inventory.setItem(slot, template.asQuantity(added));
+            needed -= added;
+        }
+        return needed;
+    }
+
+    void deliverFinite(Player player) {
+        UUID id = player.getUniqueId();
+        Map<Material, Long> pending = store.deliveries(id);
+        if (pending.isEmpty() || player.isDead() || activePalette(player) == Palette.EMPTY) {
+            return;
+        }
+
+        PlayerInventory inventory = player.getInventory();
+        ItemStack[] storage = inventory.getStorageContents();
+        var delivered = new EnumMap<Material, Long>(Material.class);
+        for (var entry : pending.entrySet()) {
+            ItemStack stack = reward(entry.getKey(), null);
+            int limit = Math.min(stack.getMaxStackSize(), inventory.getMaxStackSize());
+            long left = entry.getValue();
+            for (int slot = 0; slot < storage.length && left > 0; slot++) {
+                ItemStack item = storage[slot];
+                if (!isEmpty(item) && item.getType() == stack.getType() && stack.isSimilar(item)) {
+                    int added = (int) Math.min(left, Math.max(0, limit - item.getAmount()));
+                    if (added > 0) {
+                        storage[slot] = stack.asQuantity(item.getAmount() + added);
+                        left -= added;
+                    }
+                }
+            }
+            for (int slot = 0; slot < storage.length && left > 0; slot++) {
+                if (isEmpty(storage[slot])) {
+                    int added = (int) Math.min(left, limit);
+                    storage[slot] = stack.asQuantity(added);
+                    left -= added;
+                }
+            }
+            if (left < entry.getValue()) {
+                delivered.put(entry.getKey(), entry.getValue() - left);
+            }
+        }
+        if (!delivered.isEmpty()) {
+            try {
+                store.completeDeliveries(id, delivered);
+                inventory.setStorageContents(storage);
+            } catch (IOException ex) {
+                logger.log(Level.SEVERE, "Could not save Blockablock delivery for " + player.getName(), ex);
+            }
+        }
     }
 
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
-        refresh(event.getPlayer());
+        refreshOnJoin(event.getPlayer());
     }
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
         placementSlots.remove(event.getPlayer().getUniqueId());
+        pendingRefills.remove(event.getPlayer().getUniqueId());
     }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onPickup(PlayerAttemptPickupItemEvent event) {
         ItemStack stack = event.getItem().getItemStack();
         Palette palette = activePalette(event.getPlayer());
-        if (owner(stack) != null || palette.blocks(stack.getType()) || palette.grants().contains(stack.getType())) {
+        if (owner(stack) != null || palette.blocks(stack.getType())
+                || (store.settings().infiniteReplenish() && palette.grants().contains(stack.getType()))) {
             event.setCancelled(true);
             event.getItem().remove();
         }
@@ -204,7 +323,7 @@ final class PaletteInventory implements Listener {
         Player player = event.getPlayer();
         ItemStack item = event.getItemInHand();
         UUID id = player.getUniqueId();
-        if (event.canBuild() && id.toString().equals(owner(item))
+        if (store.settings().infiniteReplenish() && event.canBuild() && id.toString().equals(owner(item))
                 && activePalette(player).grants().contains(item.getType())) {
             int slot = event.getHand() == EquipmentSlot.OFF_HAND ? OFF_HAND_SLOT : player.getInventory().getHeldItemSlot();
             // The server consumes the placed item after BlockPlaceEvent returns.
@@ -223,7 +342,8 @@ final class PaletteInventory implements Listener {
         }
         Palette palette = activePalette(event.getPlayer());
         String owner = owner(item);
-        if (palette.blocks(item.getType()) || (owner != null && (!palette.grants().contains(item.getType())
+        if (palette.blocks(item.getType()) || (owner != null && (!store.settings().infiniteReplenish()
+                || !palette.grants().contains(item.getType())
                 || !owner.equals(event.getPlayer().getUniqueId().toString())))) {
             event.setUseItemInHand(Event.Result.DENY);
             event.setUseInteractedBlock(Event.Result.DENY);
