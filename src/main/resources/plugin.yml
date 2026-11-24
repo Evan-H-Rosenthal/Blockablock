@@ -1,0 +1,9 @@
+name: Blockablock
+version: '${version}'
+main: io.github.evanhrosenthal.blockablock.BlockablockPlugin
+api-version: '26.3'
+description: Unlock infinite building blocks and restrict selected blocks in Survival.
+commands:
+  blockablock:
+    description: Manage or view Blockablock palettes.
+    usage: /blockablock <grant|revoke|list|blacklist|toggle|reset>
